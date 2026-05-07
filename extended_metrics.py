@@ -9,7 +9,7 @@ from torchmetrics.image import (
     PeakSignalNoiseRatio,
     MultiScaleStructuralSimilarityIndexMeasure,
 )
-
+import torchvision.transforms as transforms
 # NeRV-specific imports — these files must be in the same directory
 from model_nerv import CustomDataSet, Generator
 from utils import PositionalEncoding
@@ -17,7 +17,7 @@ from edge_metrics import _parse_arch_from_ckpt_path, _load_state_dict
 
 
 """
-There will 9 new metrics added:
+There will be 6 new metrics added:
 
 1) Peak Signal-to-Noise Ratio
 
@@ -98,12 +98,10 @@ except Exception:
 
 
 def setup_from_checkpoint(ckpt_path: str, dataset_name: str = "bunny", device_str: str = "cuda"):
-
   """ Reconstructs everything needed to run metrics from a trained checkpoint path. """
 
   device    = torch.device(device_str if torch.cuda.is_available() else "cpu")
   arch_args = _parse_arch_from_ckpt_path(ckpt_path)
-  PE        = PositionalEncoding(arch_args["embed_length"])
 
   # create the positional encoder
   import re
@@ -137,34 +135,23 @@ def setup_from_checkpoint(ckpt_path: str, dataset_name: str = "bunny", device_st
 
 # PSNR and MS-SSIM
 
-
-  model.eval()
-  with torch.no_grad():
-      for data, norm_idx in val_dataloader:
-          embed_input = PE(norm_idx)
-          data = data.to(device, non_blocking=True)
-          embed_input = embed_input.to(device, non_blocking=True)
-
-          output_list = model(embed_input)
-          pred = output_list[-1]
-          # resize GT to match pred resolution (matches train_nerv.py logic)
-          gt   = F.adaptive_avg_pool2d(data, pred.shape[-2:])
-
-          # clamp to [0,1]
-          pred = pred.clamp(0.0, 1.0)
-          gt   = gt.clamp(0.0, 1.0)
-
-          psnr_metric.update(pred, gt)
-          msssim_metric.update(pred, gt)
-
-  mean_psnr   = psnr_metric.compute().item()
-  mean_msssim = msssim_metric.compute().item()
-
-  psnr_metric.reset()
-  msssim_metric.reset()
-
-  return mean_psnr, mean_msssim
-
+def measure_quality(model, val_dataloader, PE, device):
+    psnr_m   = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    msssim_m = MultiScaleStructuralSimilarityIndexMeasure(
+                   data_range=1.0, kernel_size=11).to(device)
+    model.eval()
+    with torch.no_grad():
+        for data, norm_idx in val_dataloader:
+            embed = PE(norm_idx).to(device, non_blocking=True)
+            data  = data.to(device, non_blocking=True)
+            pred  = model(embed)[-1].clamp(0.0, 1.0)
+            gt    = F.adaptive_avg_pool2d(data, pred.shape[-2:]).clamp(0.0, 1.0)
+            psnr_m.update(pred, gt)
+            msssim_m.update(pred, gt)
+    psnr   = psnr_m.compute().item()
+    msssim = msssim_m.compute().item()
+    psnr_m.reset(); msssim_m.reset()
+    return psnr, msssim
 
 # Mean + P95/P99 Latency
 
@@ -254,49 +241,35 @@ def measure_bpp_and_size(model, val_dataloader, PE, device, ckpt_path):
 
 
 # Cold Start / Load Time
-
+def measure_cold_start(ckpt_path, arch_args, device, n_runs=10):
   import gc
 
   load_times_ms = []
-
   for _ in range(n_runs):
       gc.collect()
       if device.type == "cuda":
           torch.cuda.empty_cache()
           torch.cuda.synchronize()
-
       t0 = time.perf_counter()
-
-      # Step 1 — deserialise weights from disk to CPU RAM
       ckpt = torch.load(ckpt_path, map_location="cpu")
-      if isinstance(ckpt, dict):
-          state_dict = ckpt.get("state_dict", ckpt)
-      else:
-          state_dict = ckpt
-
-      # Step 2 — build model and load weights (CPU)
-      m = model_constructor(**arch_args)
+      state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+      m = Generator(**arch_args)
       m.load_state_dict(state_dict, strict=True)
       m.eval()
-
-      # Step 3 — transfer weights to GPU (PCIe memcpy)
       m = m.to(device)
       if device.type == "cuda":
-          torch.cuda.synchronize()   # wait for all GPU memcpy to finish
-
+          torch.cuda.synchronize()
       t1 = time.perf_counter()
       load_times_ms.append((t1 - t0) * 1000.0)
-
-      del m, state_dict, ckpt   # free memory before next run
+      del m, state_dict, ckpt
 
   arr = np.array(load_times_ms)
   return {
-      "load_mean_ms" : float(np.mean(arr)),
-      "load_std_ms"  : float(np.std(arr)),
-      "load_min_ms"  : float(np.min(arr)),
-      "load_max_ms"  : float(np.max(arr)),
+      "load_mean_ms": round(float(np.mean(arr)), 2),
+      "load_std_ms" : round(float(np.std(arr)),  2),
+      "load_min_ms" : round(float(np.min(arr)),  2),
+      "load_max_ms" : round(float(np.max(arr)),  2),
   }
-
 # Energy/frame + FPS/Watt
 
 def measure_energy(model, PE, device, num_frames=300, n_warmup=20):
@@ -383,3 +356,99 @@ def measure_energy(model, PE, device, num_frames=300, n_warmup=20):
       "fps_per_watt"       : round(fps_per_watt, 3) if fps_per_watt else None,
   }
 
+
+def measure_cpu_fps(model, PE, device, n_warmup=10, n_measure=100):
+    model_cpu = model.cpu().eval()
+    dummy_embed = PE(torch.tensor([[0.5]]))  # CPU tensor, no .to(device)
+
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            _ = model_cpu(dummy_embed)
+
+    latencies_ms = []
+    with torch.no_grad():
+        for _ in range(n_measure):
+            t0 = time.perf_counter()
+            _ = model_cpu(dummy_embed)
+            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    model.to(device)  # restore to GPU after measurement
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    arr = np.array(latencies_ms)
+    mean_ms = float(np.mean(arr))
+    return {
+        "cpu_fps"    : round(1000.0 / mean_ms, 2),
+        "cpu_mean_ms": round(mean_ms, 3),
+        "cpu_std_ms" : round(float(np.std(arr)), 3),
+        "cpu_p95_ms" : round(float(np.percentile(arr, 95)), 3),
+        "cpu_p99_ms" : round(float(np.percentile(arr, 99)), 3),
+    }
+
+
+def run_all_metrics(ckpt_path, dataset_name="bunny", num_frames=132):
+    model, val_loader, PE, arch_args, device = setup_from_checkpoint(
+        ckpt_path, dataset_name)
+
+    results = {}
+
+    print("\n" + "="*55)
+    print("  NeRV Extended Edge Metrics — Google Colab T4")
+    print("="*55)
+
+    print("\n[1/6] PSNR + MS-SSIM...")
+    psnr, msssim = measure_quality(model, val_loader, PE, device)
+    results["psnr_dB"] = round(psnr, 4)
+    results["ms_ssim"] = round(msssim, 6)
+    print(f"      PSNR={psnr:.2f} dB  MS-SSIM={msssim:.4f}")
+
+    print("\n[2/6] Latency distribution (500 runs)...")
+    lat = measure_latency_distribution(model, PE, device)
+    results.update({f"lat_{k}": v for k, v in lat.items()})
+    print(f"      Mean={lat['mean_ms']:.3f}ms  P95={lat['p95_ms']:.3f}ms  P99={lat['p99_ms']:.3f}ms")
+
+    print("\n[3/6] BPP + model size...")
+    bpp = measure_bpp_and_size(model, val_loader, PE, device, ckpt_path)
+    results.update(bpp)
+    print(f"      {bpp['size_KB']:.1f} KB  BPP={bpp['bpp']:.6f}  ({bpp['T']} frames @ {bpp['H']}x{bpp['W']})")
+
+    print("\n[4/6] Cold start (10 runs)...")
+    cs = measure_cold_start(ckpt_path, arch_args, device)
+    results.update(cs)
+    print(f"      Mean={cs['load_mean_ms']:.1f}ms  Max={cs['load_max_ms']:.1f}ms")
+
+    print("\n[5/6] Energy per frame + FPS/Watt...")
+    energy = measure_energy(model, PE, device, num_frames=num_frames)
+    results.update(energy)
+    if energy["energy_per_frame_mJ"] is not None:
+        print(f"      Net={energy['net_power_W']:.2f}W  {energy['energy_per_frame_mJ']:.4f}mJ/frame  {energy['fps_per_watt']} FPS/W")
+    else:
+        print("      Skipped — pynvml unavailable")
+
+    print("\n[6/6] CPU-only FPS (100 runs)...")
+    cpu = measure_cpu_fps(model, PE, device)
+    results.update(cpu)
+    print(f"      CPU FPS={cpu['cpu_fps']:.2f}  mean={cpu['cpu_mean_ms']:.1f}ms  P99={cpu['cpu_p99_ms']:.1f}ms")
+
+    # derived ratio
+    if results.get("psnr_dB") and results.get("lat_mean_ms"):
+        results["psnr_per_latency"] = round(results["psnr_dB"] / results["lat_mean_ms"], 4)
+
+    print("\n" + "="*55)
+    print("  RESULTS SUMMARY")
+    print("="*55)
+    for k, v in results.items():
+        print(f"  {k:<30s}: {v}")
+    print("="*55)
+    return results
+
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, ".")
+    base   = "output/out_xxs/bunny"
+    folder = os.listdir(base)[0]
+    CKPT   = f"{base}/{folder}/model_val_best.pth"
+    print(f"Checkpoint: {CKPT}")
+    run_all_metrics(CKPT, dataset_name="bunny", num_frames=132)
