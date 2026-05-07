@@ -121,7 +121,7 @@ def setup_from_checkpoint(ckpt_path: str, dataset_name: str = "bunny", device_st
   val_ds     = CustomDataSet(data_dir, img_tf, vid_list=None, frame_gap=1)
   val_loader = torch.utils.data.DataLoader(
       val_ds, batch_size=1, shuffle=False,
-      num_workers=2, pin_memory=(device.type == "cuda"),
+      num_workers=0, pin_memory=(device.type == "cuda"),
       drop_last=False,
   )
 
@@ -447,7 +447,7 @@ def run_all_metrics(ckpt_path, dataset_name="bunny", num_frames=132):
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, ".")
-    base   = "output/out_xxs/bunny"
+    base   = "output/smoke_test/bunny"
     folder = os.listdir(base)[0]
     CKPT   = f"{base}/{folder}/model_val_best.pth"
     print(f"Checkpoint: {CKPT}")
