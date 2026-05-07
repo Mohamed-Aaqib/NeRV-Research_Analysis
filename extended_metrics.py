@@ -98,13 +98,13 @@ except Exception:
 
 
 def setup_from_checkpoint(ckpt_path: str, dataset_name: str = "bunny", device_str: str = "cuda"):
-      
+
   """ Reconstructs everything needed to run metrics from a trained checkpoint path. """
 
   device    = torch.device(device_str if torch.cuda.is_available() else "cpu")
   arch_args = _parse_arch_from_ckpt_path(ckpt_path)
   PE        = PositionalEncoding(arch_args["embed_length"])
-  
+
   # create the positional encoder
   import re
   base  = os.path.basename(os.path.dirname(ckpt_path))
@@ -146,7 +146,7 @@ def setup_from_checkpoint(ckpt_path: str, dataset_name: str = "bunny", device_st
           embed_input = embed_input.to(device, non_blocking=True)
 
           output_list = model(embed_input)
-          pred = output_list[-1]                          
+          pred = output_list[-1]
           # resize GT to match pred resolution (matches train_nerv.py logic)
           gt   = F.adaptive_avg_pool2d(data, pred.shape[-2:])
 
@@ -176,7 +176,7 @@ def measure_latency_distribution(model, PE, device, num_frames=300,
 
   # Build a single dummy embed from frame index 0.5 (middle of video)
   # Shape must match what PE produces — same as training
-  mid_idx  = torch.tensor([[0.5]])           
+  mid_idx  = torch.tensor([[0.5]])
   dummy_embed = PE(mid_idx).to(device)
 
   # --- Warm-up ---
@@ -218,10 +218,45 @@ def measure_latency_distribution(model, PE, device, num_frames=300,
 
 # BPP + Model Size (KB)
 
+def measure_bpp_and_size(model, val_dataloader, PE, device, ckpt_path):
+
+
+      # --- Get disk size of checkpoint ---
+  assert os.path.isfile(ckpt_path), f"Checkpoint not found: {ckpt_path}"
+  size_bytes = os.path.getsize(ckpt_path)
+  size_KB    = size_bytes / 1024.0
+  size_MB    = size_bytes / (1024.0 ** 2)
+  size_bits  = size_bytes * 8
+
+    # --- Infer H, W from one forward pass ---
+  model.eval()
+  with torch.no_grad():
+      data, norm_idx = next(iter(val_dataloader))
+      embed_input = PE(norm_idx).to(device)
+      output_list = model(embed_input)
+      _, _, H, W  = output_list[-1].shape   # (B, C, H, W)
+
+    # --- T = total frames in validation set ---
+    # val_dataloader with batch_size=1 → len(val_dataloader) == T
+  T = len(val_dataloader.dataset)
+
+  bpp = size_bits / (T * H * W)
+
+  return {
+      "size_KB"  : size_KB,
+      "size_MB"  : size_MB,
+      "T"        : T,
+      "H"        : H,
+      "W"        : W,
+      "bpp"      : bpp,
+  }
+
+
+
 # Cold Start / Load Time
 
   import gc
-  
+
   load_times_ms = []
 
   for _ in range(n_runs):
@@ -263,4 +298,88 @@ def measure_latency_distribution(model, PE, device, num_frames=300,
   }
 
 # Energy/frame + FPS/Watt
+
+def measure_energy(model, PE, device, num_frames=300, n_warmup=20):
+
+  if not _pynvml_ok:
+      print("[SKIP] pynvml not available — energy metrics skipped")
+      return {
+          "avg_power_W"        : None,
+          "energy_per_frame_mJ": None,
+          "fps_per_watt"       : None,
+      }
+
+  model.eval()
+
+  # Build frame index tensor: evenly spaced normalised indices
+  norm_indices = torch.linspace(0, 1, num_frames).unsqueeze(1)  # (T, 1)
+  embeds = [PE(norm_indices[i:i+1]).to(device) for i in range(num_frames)]
+
+  # --- Warm-up ---
+  with torch.no_grad():
+      for i in range(n_warmup):
+          _ = model(embeds[i % num_frames])
+  if device.type == "cuda":
+      torch.cuda.synchronize()
+
+  # --- Measure idle power baseline (2 seconds) ---
+  idle_readings = []
+  stop_idle = threading.Event()
+  def _poll_idle():
+      while not stop_idle.is_set():
+          try:
+              idle_readings.append(
+                  pynvml.nvmlDeviceGetPowerUsage(_gpu_handle) / 1000.0)
+          except Exception:
+              pass
+          time.sleep(0.005)
+  t_idle = threading.Thread(target=_poll_idle, daemon=True)
+  t_idle.start()
+  time.sleep(2.0)
+  stop_idle.set()
+  t_idle.join()
+  idle_power_W = float(np.mean(idle_readings)) if idle_readings else 0.0
+
+  # --- Decode + power polling ---
+  power_readings = []
+  stop_flag = threading.Event()
+
+  def _poll_power():
+      while not stop_flag.is_set():
+          try:
+              power_readings.append(
+                  pynvml.nvmlDeviceGetPowerUsage(_gpu_handle) / 1000.0)
+          except Exception:
+              pass
+          time.sleep(0.005)   # poll every 5 ms
+
+  poll_thread = threading.Thread(target=_poll_power, daemon=True)
+  poll_thread.start()
+
+  t_start = time.perf_counter()
+  with torch.no_grad():
+      for i in range(num_frames):
+          _ = model(embeds[i])
+  if device.type == "cuda":
+      torch.cuda.synchronize()
+  elapsed_s = time.perf_counter() - t_start
+
+  stop_flag.set()
+  poll_thread.join()
+
+  avg_power_W      = float(np.mean(power_readings)) if power_readings else 0.0
+  net_power_W      = max(avg_power_W - idle_power_W, 0.0)  # subtract idle
+  total_energy_J   = net_power_W * elapsed_s
+  energy_per_frame_mJ = (total_energy_J / num_frames) * 1000.0
+  fps              = num_frames / elapsed_s
+  fps_per_watt     = fps / avg_power_W if avg_power_W > 0 else None
+
+  return {
+      "avg_power_W"        : round(avg_power_W, 3),
+      "idle_power_W"       : round(idle_power_W, 3),
+      "net_power_W"        : round(net_power_W, 3),
+      "energy_per_frame_mJ": round(energy_per_frame_mJ, 4),
+      "fps_during_energy"  : round(fps, 2),
+      "fps_per_watt"       : round(fps_per_watt, 3) if fps_per_watt else None,
+  }
 
