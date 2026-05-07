@@ -118,7 +118,7 @@ def setup_from_checkpoint(ckpt_path: str, dataset_name: str = "bunny", device_st
   # val dataloader — all frames, batch=1, no shuffle
   data_dir   = f"./data/{dataset_name.lower()}"
   img_tf     = transforms.ToTensor()
-  val_ds     = CustomDataSet(data_dir, img_tf, vid_list=None, frame_gap=1)
+  val_ds = CustomDataSet(data_dir, img_tf, vid_list=[None], frame_gap=1)
   val_loader = torch.utils.data.DataLoader(
       val_ds, batch_size=1, shuffle=False,
       num_workers=0, pin_memory=(device.type == "cuda"),
@@ -163,9 +163,9 @@ def measure_latency_distribution(model, PE, device, num_frames=300,
 
   # Build a single dummy embed from frame index 0.5 (middle of video)
   # Shape must match what PE produces — same as training
-  mid_idx  = torch.tensor([[0.5]])
-  dummy_embed = PE(mid_idx).to(device)
-
+  mid_idx = torch.tensor([0.5])
+  dummy_embed = PE(mid_idx).unsqueeze(0).to(device)
+  print(f"[DEBUG] Dummy embed shape: {dummy_embed.shape} | dtype: {dummy_embed.dtype}")
   # --- Warm-up ---
   with torch.no_grad():
       for _ in range(n_warmup):
@@ -286,8 +286,12 @@ def measure_energy(model, PE, device, num_frames=300, n_warmup=20):
 
   # Build frame index tensor: evenly spaced normalised indices
   norm_indices = torch.linspace(0, 1, num_frames).unsqueeze(1)  # (T, 1)
-  embeds = [PE(norm_indices[i:i+1]).to(device) for i in range(num_frames)]
 
+  embeds = [
+      PE(norm_indices[i]).unsqueeze(0).to(device) 
+      for i in range(num_frames)
+  ]
+  
   # --- Warm-up ---
   with torch.no_grad():
       for i in range(n_warmup):
@@ -359,8 +363,7 @@ def measure_energy(model, PE, device, num_frames=300, n_warmup=20):
 
 def measure_cpu_fps(model, PE, device, n_warmup=10, n_measure=100):
     model_cpu = model.cpu().eval()
-    dummy_embed = PE(torch.tensor([[0.5]]))  # CPU tensor, no .to(device)
-
+    dummy_embed = PE(torch.tensor([0.5])).unsqueeze(0)
     with torch.no_grad():
         for _ in range(n_warmup):
             _ = model_cpu(dummy_embed)
