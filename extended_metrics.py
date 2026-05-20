@@ -288,10 +288,10 @@ def measure_energy(model, PE, device, num_frames=300, n_warmup=20):
   norm_indices = torch.linspace(0, 1, num_frames).unsqueeze(1)  # (T, 1)
 
   embeds = [
-      PE(norm_indices[i]).unsqueeze(0).to(device) 
+      PE(norm_indices[i]).unsqueeze(0).to(device)
       for i in range(num_frames)
   ]
-  
+
   # --- Warm-up ---
   with torch.no_grad():
       for i in range(n_warmup):
@@ -450,8 +450,14 @@ def run_all_metrics(ckpt_path, dataset_name="bunny", num_frames=132):
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, ".")
-    base   = "output/smoke_test/bunny"
-    folder = os.listdir(base)[0]
-    CKPT   = f"{base}/{folder}/model_val_best.pth"
+
+    if len(sys.argv) < 2:
+        print("Usage: python extended_metrics.py <ckpt_path>")
+        exit()
+
+    CKPT = sys.argv[1]
     print(f"Checkpoint: {CKPT}")
-    run_all_metrics(CKPT, dataset_name="bunny", num_frames=132)
+    run_all_metrics(
+        ckpt_path=CKPT,
+        dataset_name="yachtride",
+        num_frames=132)
