@@ -390,7 +390,7 @@ def measure_cpu_fps(model, PE, device, n_warmup=10, n_measure=100):
     }
 
 
-def run_all_metrics(ckpt_path, dataset_name="bunny", num_frames=132):
+def run_all_metrics(ckpt_path, dataset_name="yachtride", num_frames=132):
     model, val_loader, PE, arch_args, device = setup_from_checkpoint(
         ckpt_path, dataset_name)
 
@@ -446,18 +446,17 @@ def run_all_metrics(ckpt_path, dataset_name="bunny", num_frames=132):
     print("="*55)
     return results
 
+    if __name__ == "__main__":
+      import sys
 
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, ".")
-
-    if len(sys.argv) < 2:
+      if len(sys.argv) < 2:
         print("Usage: python extended_metrics.py <ckpt_path>")
         exit()
 
-    CKPT = sys.argv[1]
-    print(f"Checkpoint: {CKPT}")
-    run_all_metrics(
-        ckpt_path=CKPT,
-        dataset_name="yachtride",
-        num_frames=132)
+      CKPT = sys.argv[1]
+
+      run_all_metrics(
+          ckpt_path=CKPT,
+          dataset_name="yachtride",
+          num_frames=132
+      )
